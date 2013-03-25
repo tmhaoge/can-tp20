@@ -48,7 +48,7 @@ enum tp20_state {
   TP20_CS,
   TP20_CS_ACK,
   TP20_DONE, /* must be below all connect related states */
-	TP20_CLOSE, /* see sk->sk_err for details */ 
+  TP20_CLOSE, /* see sk->sk_err for details */
   TP20_ESTABLISHED 
 };
 
@@ -79,10 +79,11 @@ static inline struct tp20_sock* tp20_sk(struct sock* sk)
   return (struct tp20_sock*)sk;
 }
 
-static int send(struct tp20_sock* so, const struct can_frame* cf)
+static int send(struct tp20_sock* so, const void* data, int size)
 {
   struct net_device* dev = NULL;
   struct sk_buff* skb = NULL;
+  struct can_frame* cf;
   int err = 0;
 
   dev = dev_get_by_index(&init_net, so->ifindex);
@@ -100,7 +101,11 @@ static int send(struct tp20_sock* so, const struct can_frame* cf)
   skb->dev = dev;
   skb->sk = &so->sk;
 
-  memcpy(skb->data, cf, sizeof(struct can_frame));
+  cf = (struct can_frame*)skb->data;
+  cf->can_id = so->tx.id;
+  cf->can_dlc = size;
+
+  memcpy(cf->data, data, size);
 
   err = can_send(skb, 1);
   skb = NULL; /* can_send took ownership */
@@ -115,6 +120,37 @@ out:
   return err;
 }
 
+static void tp20_rcv(struct sk_buff* skb, void* data);
+
+/* set the socket's tx id. for orthogonality with set_rx */
+static int set_tx(struct tp20_sock* so, canid_t tx_id)
+{
+  so->tx.id = tx_id;
+
+  return 0;
+}
+
+/* set the socket's rx id. causes tp20_rcv to be called for any can frame with can_id == rx_id */
+static int set_rx(struct tp20_sock* so, canid_t rx_id)
+{
+  struct net_device* dev = dev_get_by_index(&init_net, so->ifindex);
+
+  if(!dev)
+    return -ENODEV;
+
+  if(so->rx.id != 0)
+    can_rx_unregister(dev, so->rx.id, CAN_SFF_MASK, tp20_rcv, &so->sk);
+
+  so->rx.id = rx_id;
+
+  if(so->rx.id != 0)
+    can_rx_register(dev, so->rx.id, CAN_SFF_MASK, tp20_rcv, &so->sk, "tp20");
+
+  dev_put(dev);
+
+  return 0;
+}
+
 /*
  * connection test
  */
@@ -124,16 +160,11 @@ struct tp20_ct {
 
 static int send_ct(struct tp20_sock* so)
 {
-  struct can_frame cf;
-  struct tp20_ct* ct;
+  struct tp20_ct ct;
 
-  cf.can_id = so->tx.id;
-  cf.can_dlc = sizeof(struct tp20_ct);
+  ct.tpc1 = TP20_OP_CT;
 
-  ct = (struct tp20_ct*)cf.data;
-  ct->tpc1 = TP20_OP_CT;
-
-  return send(so, &cf);
+  return send(so, &ct, sizeof(ct));
 }
 
 static enum hrtimer_restart ct_timeout(struct hrtimer* timer)
@@ -204,21 +235,16 @@ static int byte_to_time(__u8 b)
 
 static int send_cs(struct tp20_sock* so)
 {
-  struct can_frame cf;
-  struct tp20_cs* cs;
+  struct tp20_cs cs;
 
-  cf.can_id = so->tx.id;
-  cf.can_dlc = sizeof(struct tp20_cs);
+  cs.tpc1 = TP20_OP_CS;
+  cs.tpc2 = so->tx.block_size;
+  cs.t1 = time_to_byte(so->tx.ack_timeout);
+  cs.t2 = 0xFF;
+  cs.t3 = time_to_byte(so->tx.send_delay);
+  cs.t4 = 0xFF;
 
-  cs = (struct tp20_cs*)cf.data;
-  cs->tpc1 = TP20_OP_CS;
-  cs->tpc2 = so->tx.block_size;
-  cs->t1 = time_to_byte(so->tx.ack_timeout);
-  cs->t2 = 0xFF;
-  cs->t3 = time_to_byte(so->tx.send_delay);
-  cs->t4 = 0xFF;
-
-  return send(so, &cf);
+  return send(so, &cs, sizeof(cs));
 }
 
 static void handle_cs_ack(struct sock* sk, struct sk_buff* skb)
@@ -260,8 +286,8 @@ static void handle_cs_ack(struct sock* sk, struct sk_buff* skb)
   wake_up_interruptible(sk_sleep(sk)); /* tp20_connect wants to know about this */
 
   /* start connection test timer */
-  so->timeout_count = 0;
   so->timer.function = ct_timeout;
+  so->timeout_count = 0;
   hrtimer_start(&so->timer, TP20_CT_TIMEOUT, HRTIMER_MODE_REL);
 
   return;
@@ -327,22 +353,17 @@ static inline int rx_info(struct tp20_cr* cs)
 
 static int send_cr(struct tp20_sock* so)
 {
-  struct can_frame cf;
-  struct tp20_cr* cr;
+  struct tp20_cr cr;
 
-  cf.can_id = so->tx.id;
-  cf.can_dlc = sizeof(struct tp20_cr);
+  cr.destination = so->destination;
+  cr.opcode = TP20_OP_CR;
+  cr.tx_id_low = 0;
+	cr.tx_id_high_info = (TP20_INFO_IDUNSPEC << 3);
+  cr.rx_id_low = so->rx.id;
+  cr.rx_id_high_info = (TP20_INFO_IDSPEC << 3) | (so->rx.id >> 8);
+  cr.app_type = so->app_type;
 
-  cr = (struct tp20_cr*)cf.data;
-  cr->destination = so->destination;
-  cr->opcode = TP20_OP_CR;
-  cr->tx_id_low = 0;
-	cr->tx_id_high_info = (TP20_INFO_IDUNSPEC << 3);
-  cr->rx_id_low = so->rx.id;
-  cr->rx_id_high_info = (TP20_INFO_IDSPEC << 3) | (so->rx.id >> 8);
-  cr->app_type = so->app_type;
-
-  return send(so, &cf);
+  return send(so, &cr, sizeof(cr));
 }
 
 static void handle_cr_ack(struct sock* sk, struct sk_buff* skb)
@@ -381,7 +402,7 @@ static void handle_cr_ack(struct sock* sk, struct sk_buff* skb)
     goto out_err;
   }
 
-  so->rx.id = tx_id(cr);
+  set_rx(so, tx_id(cr));
 
   if(rx_id(cr) != so->tx.id) {
     TP20_DEBUG(0, "bad rx_id in rcv_channel_setup_ack");
@@ -400,8 +421,8 @@ static void handle_cr_ack(struct sock* sk, struct sk_buff* skb)
   so->sk.sk_state = TP20_CS_ACK;
 
   /* start timer in case we get no reply */
-  so->timeout_count = 0;
   so->timer.function = cs_timeout;
+  so->timeout_count = 0;
   hrtimer_start(&so->timer, TP20_CS_TIMEOUT, HRTIMER_MODE_REL);
 
   return;
@@ -412,7 +433,7 @@ out_err:
   wake_up_interruptible(sk_sleep(sk));
 }
 
-static enum hrtimer_restart channel_setup_timeout(struct hrtimer* timer)
+static enum hrtimer_restart cr_timeout(struct hrtimer* timer)
 {
   struct tp20_sock* so = container_of(timer, struct tp20_sock, timer);
   struct sock* sk = &so->sk;
@@ -498,25 +519,24 @@ static int tp20_connect(struct socket* sock, struct sockaddr* uaddr, int len, in
   /* setup socket state */
   so->ifindex = addr->can_ifindex;
   so->destination = addr->can_addr.tp.rx_id;
-  so->tx.id = TP20_TX_INITIAL_ID;
   so->tx.block_size = TP20_TX_BLOCK_SIZE;
-  so->rx.id = TP20_RX_INITIAL_ID;
   sk->sk_state = TP20_CR_ACK;
   sock->state = SS_CONNECTING;
+
+  err = set_tx(so, TP20_TX_INITIAL_ID);
+  if(err) goto out;
+
+  err = set_rx(so, TP20_RX_INITIAL_ID);
+  if(err) goto out;
 
   /* send channel request telegram */
   err = send_cr(so);
   if(err)
     goto out;
 
-  /* start listening for replies */
-  err = can_rx_register(dev, so->rx.id, CAN_SFF_MASK, tp20_rcv, sk, "tp20");
-  if(err)
-    goto out;
-
   /* start timer in case we get no reply */
+  so->timer.function = cr_timeout;
   so->timeout_count = 0;
-  so->timer.function = channel_setup_timeout;
   hrtimer_start(&so->timer, TP20_CR_TIMEOUT, HRTIMER_MODE_REL);
 
   /* wait to connect */
@@ -543,11 +563,15 @@ out:
 
 static int tp20_notifier(struct notifier_block* nb, unsigned long msg, void* data)
 {
-  struct net_device* dev = (struct net_device*)data;
   struct tp20_sock* so = container_of(nb, struct tp20_sock, notifier);
   struct sock* sk = &so->sk;
+  struct net_device* dev = NULL;
 
   lock_sock(sk);
+
+  dev = dev_get_by_index(&init_net, so->ifindex);
+  if(!dev)
+    goto out;
 
   if(dev_net(dev) != &init_net)
     goto out;
@@ -560,8 +584,8 @@ static int tp20_notifier(struct notifier_block* nb, unsigned long msg, void* dat
 
   switch(msg) {
   case NETDEV_UNREGISTER:
-    if(so->ifindex >= 0)
-      can_rx_unregister(dev, so->rx.id, CAN_SFF_MASK, tp20_rcv, sk);
+    set_tx(so, 0);
+    set_rx(so, 0);
     so->ifindex = -1;
 
     sk->sk_err = ENODEV;
@@ -579,6 +603,9 @@ static int tp20_notifier(struct notifier_block* nb, unsigned long msg, void* dat
   }
 
 out:
+  if(dev)
+    dev_put(dev);
+
   release_sock(sk);
 
   return NOTIFY_DONE;
@@ -614,12 +641,10 @@ static int tp20_release(struct socket* sock)
 
   unregister_netdevice_notifier(&so->notifier);
 
-  if(so->ifindex >= 0) {
-    struct net_device* dev = dev_get_by_index(&init_net, so->ifindex);
-    can_rx_unregister(dev, so->rx.id, CAN_SFF_MASK, tp20_rcv, &so->sk);
-  }
+  set_tx(so, 0);
+  set_rx(so, 0);
 
-	return 0;
+  return 0;
 }
 
 /*
